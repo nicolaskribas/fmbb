@@ -1,0 +1,9 @@
+[package]
+name = "fmbb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+config = "0.13.3"
+serde = { version = "1.0.158", features = ["derive"] }
+toml = "0.7.3"
