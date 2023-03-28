@@ -5,5 +5,7 @@ edition = "2021"
 
 [dependencies]
 config = "0.13.3"
+paho-mqtt = "0.12.1"
 serde = { version = "1.0.158", features = ["derive"] }
+tokio = { version = "1.27.0", features = ["full"] }
 toml = "0.7.3"

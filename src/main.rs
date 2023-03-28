@@ -1,6 +1,18 @@
-use std::{env, process};
+use std::time::Instant;
+use std::{env, process, vec};
+use std::sync::Arc;
 
-fn main() {
+use mqtt::{CreateOptionsBuilder, Message, ConnectOptions, ConnectOptionsBuilder};
+use tokio::sync::Notify;
+use tokio::time::{sleep, Duration, self};
+
+use paho_mqtt as mqtt;
+
+static TOPIC: &str = "federated/benchmark";
+static QOS: i32 = 2;
+
+#[tokio::main]
+async fn main() {
     let Some(config_file) = env::args().nth(1) else {
         eprintln!("No configuration file provided!");
         process::exit(1);
@@ -11,40 +23,77 @@ fn main() {
         process::exit(1);
     });
 
+    let start = Arc::new(Notify::new());
+
     let mut id = 0;
     for batch in &config.publishers {
-        for i in 0..batch.clients {
-            Publisher::new(id, batch.count);
+        for _ in 0..batch.clients {
+            let pubi = Publisher::new(id, batch.count, start.clone());
+            tokio::spawn(pubi.run());
             id += batch.count;
         }
     }
-    let total_count = id;
+    let total_messages = id;
 
     for batch in &config.subscribers {
-        for i in 0..batch.clients {
-            Subscriber::new(total_count);
+        for _ in 0..batch.clients {
+            let sub = Subscriber::new(total_messages);
+            tokio::spawn(sub.run());
         }
     }
+
+    sleep(Duration::from_secs(config.wait)).await;
+    start.notify_waiters();
 }
 
 struct Publisher {
     starting_id: u32,
     count: u32,
+    start: Arc<Notify>,
 }
-impl Publisher {
-    fn new(starting_id: u32, count: u32) -> Self {
-        Publisher { starting_id, count }
 
+impl Publisher {
+    fn new(starting_id: u32, count: u32, start: Arc<Notify>) -> Self {
+        Publisher { starting_id, count, start }
+    }
+
+    async fn run(self) {
+        // setup 
+
+        let opts = CreateOptionsBuilder::new().finalize();
+        let client = mqtt::AsyncClient::new(opts).unwrap();
+
+        self.start.notified().await;
+
+
+        let mut interval = time::interval(Duration::from_millis(10));
+        for id in self.starting_id..self.count {
+            interval.tick().await;
+            let payload = id.to_le_bytes();
+            // let now = Instant::now();
+            let msg = Message::new(TOPIC, payload, QOS);
+            client.publish(msg);
+        }
     }
 }
 
 struct Subscriber {
-    expecting: u32,
+    expecting: usize,
+    received: Vec<bool>,
 }
 
 impl Subscriber {
-    fn new(expecting: u32) -> Self {
-        Self { expecting }
+    fn new(expecting: usize) -> Self {
+        Self { expecting, received: vec![false; expecting] }
+    }
+
+    pub async fn run(self) {
+        let opts = CreateOptionsBuilder::new().finalize();
+        let client = mqtt::AsyncClient::new(opts).unwrap();
+
+        let conn_opts = ConnectOptionsBuilder::new().finalize();
+        client.connect(conn_opts).await.unwrap();
+        client.subscribe(TOPIC, QOS).await.unwrap();
     }
 }
 
@@ -54,21 +103,22 @@ mod config {
 
     #[derive(Deserialize)]
     pub struct Settings {
+        pub wait: u64,
         pub publishers: Vec<PubBatch>,
         pub subscribers: Vec<SubBatch>,
     }
 
     #[derive(Deserialize)]
     pub struct PubBatch {
-        broker: String,
+        pub broker: String,
         pub clients: u32,
-        interval: u32,
+        pub interval: u32,
         pub count: u32,
     }
 
     #[derive(Deserialize)]
     pub struct SubBatch {
-        broker: String,
+        pub broker: String,
         pub clients: u32,
     }
 
