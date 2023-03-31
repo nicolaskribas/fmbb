@@ -1,8 +1,11 @@
+use std::time::SystemTime;
 use std::time::Instant;
 use std::{env, process, vec};
 use std::sync::Arc;
 
 use mqtt::{CreateOptionsBuilder, Message, ConnectOptions, ConnectOptionsBuilder};
+use serde::{Serialize, Deserialize};
+use tokio::sync::Barrier;
 use tokio::sync::Notify;
 use tokio::time::{sleep, Duration, self};
 
@@ -23,7 +26,11 @@ async fn main() {
         process::exit(1);
     });
 
-    let start = Arc::new(Notify::new());
+    let start_publishing = Arc::new(Notify::new());
+    let end_publishing = Arc::new(Barrier::new());
+
+    let stop_receiving = Arc::new(Notify::new());
+
 
     let mut id = 0;
     for batch in &config.publishers {
@@ -37,13 +44,34 @@ async fn main() {
 
     for batch in &config.subscribers {
         for _ in 0..batch.clients {
+            let a = time::Instant::new();
             let sub = Subscriber::new(total_messages);
             tokio::spawn(sub.run());
         }
     }
 
+    // wait before start
     sleep(Duration::from_secs(config.wait)).await;
+
+    // start publishers
     start.notify_waiters();
+
+    // wait for publishers to end
+    end_publishing.wait().await;
+    
+    // wait some time for subscribers to receive all the possivel publications
+    sleep(Duration::from_secs(5)).await;
+
+    // stop all publications
+
+
+    // 
+}
+
+#[derive(Serialize, Deserialize)]
+struct Payload {
+    pub id: usize,
+    pub creation: SystemTime,
 }
 
 struct Publisher {
@@ -69,9 +97,9 @@ impl Publisher {
         let mut interval = time::interval(Duration::from_millis(10));
         for id in self.starting_id..self.count {
             interval.tick().await;
-            let payload = id.to_le_bytes();
-            // let now = Instant::now();
-            let msg = Message::new(TOPIC, payload, QOS);
+            let pl = Payload { id , creation: SystemTime::now()};
+            let pl = bincode::serialize(&pl).unwrap();
+            let msg = Message::new(TOPIC, pl, QOS);
             client.publish(msg);
         }
     }
@@ -88,12 +116,40 @@ impl Subscriber {
     }
 
     pub async fn run(self) {
+        let mut latencies = Vec::with_capacity(self.expecting);
+        let mut cache = vec![false; self.expecting];
+        let mut dup = 0;
+
         let opts = CreateOptionsBuilder::new().finalize();
-        let client = mqtt::AsyncClient::new(opts).unwrap();
+        let mut client = mqtt::AsyncClient::new(opts).unwrap();
+
+        let stream = client.get_stream(None); // None = unbound channel
 
         let conn_opts = ConnectOptionsBuilder::new().finalize();
         client.connect(conn_opts).await.unwrap();
         client.subscribe(TOPIC, QOS).await.unwrap();
+
+        loop {
+            let message = stream.recv().await.expect("client should not close the channel");
+            if let Some(message) = message {
+                let pl: Payload = bincode::deserialize(message.payload()).expect("serialization and deserialization should occur without errors");
+
+                if cache[pl.id] {
+                    dup += 1;
+                } else {
+                    cache[pl.id] = true;
+                }
+
+                match pl.creation.elapsed() {
+                    Ok(latency) => {
+                        latencies.push(latency);
+                    }
+                    Err(err) => println!("time error {}", err),
+                }
+            } else {
+                println!("disconnected");
+            }
+        }
     }
 }
 
