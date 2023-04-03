@@ -1,18 +1,16 @@
-use std::time::SystemTime;
-use std::time::Instant;
-use std::{env, process, vec};
+use mqtt::{ConnectOptionsBuilder, CreateOptionsBuilder, Message};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
-use mqtt::{CreateOptionsBuilder, Message, ConnectOptions, ConnectOptionsBuilder};
-use serde::{Serialize, Deserialize};
-use tokio::sync::Barrier;
+use std::time::SystemTime;
+use std::{env, process, vec};
 use tokio::sync::Notify;
-use tokio::time::{sleep, Duration, self};
+use tokio::time::{self, sleep, Duration};
 
 use paho_mqtt as mqtt;
 
 static TOPIC: &str = "federated/benchmark";
 static QOS: i32 = 2;
+static MAX_BUFFERED: i32 = 0;
 
 #[tokio::main]
 async fn main() {
@@ -21,22 +19,27 @@ async fn main() {
         process::exit(1);
     };
 
-    let config = config::load(&config_file).unwrap_or_else(|e|{
+    let config = config::load(&config_file).unwrap_or_else(|e| {
         eprintln!("Error in configuration file: {e}");
         process::exit(1);
     });
 
     let start_publishing = Arc::new(Notify::new());
-    let end_publishing = Arc::new(Barrier::new());
+    // let stop_receiving = Arc::new(Notify::new());
 
-    let stop_receiving = Arc::new(Notify::new());
-
+    let mut pubs = Vec::new();
 
     let mut id = 0;
     for batch in &config.publishers {
         for _ in 0..batch.clients {
-            let pubi = Publisher::new(id, batch.count, start.clone());
-            tokio::spawn(pubi.run());
+            let task = publisher_task(
+                batch.broker.clone(),
+                id,
+                batch.count,
+                Duration::from_nanos(1000000000 / batch.rate),
+                start_publishing.clone(),
+            );
+            pubs.push(tokio::spawn(task));
             id += batch.count;
         }
     }
@@ -44,28 +47,20 @@ async fn main() {
 
     for batch in &config.subscribers {
         for _ in 0..batch.clients {
-            let a = time::Instant::new();
-            let sub = Subscriber::new(total_messages);
-            tokio::spawn(sub.run());
+            tokio::spawn(subscriber_task(batch.broker.clone(), total_messages));
         }
     }
 
-    // wait before start
+    // wait some time and then start publishers
     sleep(Duration::from_secs(config.wait)).await;
+    start_publishing.notify_waiters();
 
-    // start publishers
-    start.notify_waiters();
+    for publisher in pubs {
+        publisher.await;
+    }
 
-    // wait for publishers to end
-    end_publishing.wait().await;
-    
-    // wait some time for subscribers to receive all the possivel publications
+    // give subscribers some time to receive all publications
     sleep(Duration::from_secs(5)).await;
-
-    // stop all publications
-
-
-    // 
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,92 +69,88 @@ struct Payload {
     pub creation: SystemTime,
 }
 
-struct Publisher {
-    starting_id: u32,
-    count: u32,
+async fn publisher_task(
+    broker: String,
+    start_id: usize,
+    count: usize,
+    interval: Duration,
     start: Arc<Notify>,
+) -> Result<(), ()> {
+    let opts = CreateOptionsBuilder::new()
+        .server_uri(broker)
+        .max_buffered_messages(MAX_BUFFERED)
+        .finalize();
+    let client = mqtt::AsyncClient::new(opts).unwrap();
+
+    start.notified().await;
+
+    let mut interval = time::interval(interval);
+    for id in start_id..start_id + count {
+        interval.tick().await;
+
+        let payload = Payload {
+            id,
+            creation: SystemTime::now(),
+        };
+
+        let payload = bincode::serialize(&payload).unwrap();
+        let message = Message::new(TOPIC, payload, QOS);
+
+        client.publish(message);
+    }
+    Ok(())
 }
 
-impl Publisher {
-    fn new(starting_id: u32, count: u32, start: Arc<Notify>) -> Self {
-        Publisher { starting_id, count, start }
-    }
+async fn subscriber_task(broker: String, expecting: usize) -> Result<(), ()> {
+    let mut latencies = Vec::with_capacity(expecting);
+    let mut cache = vec![false; expecting];
+    let mut dup = 0;
 
-    async fn run(self) {
-        // setup 
+    let opts = CreateOptionsBuilder::new().finalize();
+    let mut client = mqtt::AsyncClient::new(opts).unwrap();
 
-        let opts = CreateOptionsBuilder::new().finalize();
-        let client = mqtt::AsyncClient::new(opts).unwrap();
+    let stream = client.get_stream(None); // None = unbound channel
 
-        self.start.notified().await;
+    let conn_opts = ConnectOptionsBuilder::new().finalize();
+    client.connect(conn_opts).await.unwrap();
+    client.subscribe(TOPIC, QOS).await.unwrap();
 
+    loop {
+        let message = stream
+            .recv()
+            .await
+            .expect("client should not close the channel");
+        if let Some(message) = message {
+            let pl: Payload = bincode::deserialize(message.payload())
+                .expect("serialization and deserialization should occur without errors");
 
-        let mut interval = time::interval(Duration::from_millis(10));
-        for id in self.starting_id..self.count {
-            interval.tick().await;
-            let pl = Payload { id , creation: SystemTime::now()};
-            let pl = bincode::serialize(&pl).unwrap();
-            let msg = Message::new(TOPIC, pl, QOS);
-            client.publish(msg);
-        }
-    }
-}
-
-struct Subscriber {
-    expecting: usize,
-    received: Vec<bool>,
-}
-
-impl Subscriber {
-    fn new(expecting: usize) -> Self {
-        Self { expecting, received: vec![false; expecting] }
-    }
-
-    pub async fn run(self) {
-        let mut latencies = Vec::with_capacity(self.expecting);
-        let mut cache = vec![false; self.expecting];
-        let mut dup = 0;
-
-        let opts = CreateOptionsBuilder::new().finalize();
-        let mut client = mqtt::AsyncClient::new(opts).unwrap();
-
-        let stream = client.get_stream(None); // None = unbound channel
-
-        let conn_opts = ConnectOptionsBuilder::new().finalize();
-        client.connect(conn_opts).await.unwrap();
-        client.subscribe(TOPIC, QOS).await.unwrap();
-
-        loop {
-            let message = stream.recv().await.expect("client should not close the channel");
-            if let Some(message) = message {
-                let pl: Payload = bincode::deserialize(message.payload()).expect("serialization and deserialization should occur without errors");
-
-                if cache[pl.id] {
-                    dup += 1;
-                } else {
-                    cache[pl.id] = true;
-                }
-
-                match pl.creation.elapsed() {
-                    Ok(latency) => {
-                        latencies.push(latency);
-                    }
-                    Err(err) => println!("time error {}", err),
-                }
+            if cache[pl.id] {
+                dup += 1;
             } else {
-                println!("disconnected");
+                cache[pl.id] = true;
+                break;
             }
+
+            match pl.creation.elapsed() {
+                Ok(latency) => {
+                    latencies.push(latency);
+                }
+                Err(err) => println!("time error {}", err),
+            }
+        } else {
+            println!("disconnected");
         }
     }
+    Ok(())
 }
 
 mod config {
-    use serde::Deserialize;
     use config::{Config, ConfigError, File, FileFormat};
+    use serde::Deserialize;
 
     #[derive(Deserialize)]
     pub struct Settings {
-        pub wait: u64,
+        pub wait: u64, // time waited before starting publishing
         pub publishers: Vec<PubBatch>,
         pub subscribers: Vec<SubBatch>,
     }
@@ -168,8 +159,9 @@ mod config {
     pub struct PubBatch {
         pub broker: String,
         pub clients: u32,
-        pub interval: u32,
-        pub count: u32,
+        pub rate: u64,    // messages per second
+        pub count: usize, // total of messages to publish
+        pub size: u32,    //size of the message
     }
 
     #[derive(Deserialize)]
@@ -179,7 +171,9 @@ mod config {
     }
 
     pub fn load(file: &str) -> Result<Settings, ConfigError> {
-        let conf = Config::builder().add_source(File::new(file, FileFormat::Toml)).build()?;
+        let conf = Config::builder()
+            .add_source(File::new(file, FileFormat::Toml))
+            .build()?;
         conf.try_deserialize()
     }
 }
