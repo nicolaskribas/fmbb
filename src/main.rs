@@ -36,7 +36,7 @@ async fn main() {
                 batch.broker.clone(),
                 id,
                 batch.count,
-                Duration::from_nanos(1000000000 / batch.rate),
+                Duration::from_nanos(1_000_000_000 / batch.rate),
                 start_publishing.clone(),
             );
             pubs.push(tokio::spawn(task));
