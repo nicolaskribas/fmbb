@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use std::{env, process, vec};
 use tokio::sync::Notify;
 use tokio::time::{self, sleep, Duration};
+use tokio_util::sync::CancellationToken;
 
 use paho_mqtt as mqtt;
 
@@ -25,7 +26,7 @@ async fn main() {
     });
 
     let start_publishing = Arc::new(Notify::new());
-    // let stop_receiving = Arc::new(Notify::new());
+    let stop_receiving = CancellationToken::new();
 
     let mut pubs = Vec::new();
 
@@ -45,9 +46,13 @@ async fn main() {
     }
     let total_messages = id;
 
+    let mut subs = Vec::new();
+
     for batch in &config.subscribers {
         for _ in 0..batch.clients {
-            tokio::spawn(subscriber_task(batch.broker.clone(), total_messages));
+            let task =
+                subscriber_task(batch.broker.clone(), total_messages, stop_receiving.clone());
+            subs.push(tokio::spawn(task));
         }
     }
 
@@ -56,11 +61,21 @@ async fn main() {
     start_publishing.notify_waiters();
 
     for publisher in pubs {
-        publisher.await;
+        let res = publisher.await.unwrap().unwrap();
+        println!(
+            "Published {} messages with success, {} failed",
+            res.0, res.1
+        );
     }
 
     // give subscribers some time to receive all publications
     sleep(Duration::from_secs(5)).await;
+    stop_receiving.cancel();
+
+    for subscriber in subs {
+        let res = subscriber.await.unwrap().unwrap();
+        println!("Subscriber was expecting {} messages, received {} unique messages, {} duplicates, latency: {}ms", res.0, res.1, res.2, res.3.as_millis());
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,16 +90,22 @@ async fn publisher_task(
     count: usize,
     interval: Duration,
     start: Arc<Notify>,
-) -> Result<(), ()> {
-    let opts = CreateOptionsBuilder::new()
+) -> Result<(u32, u32), mqtt::Error> {
+    let cli_opts = CreateOptionsBuilder::new()
         .server_uri(broker)
         .max_buffered_messages(MAX_BUFFERED)
         .finalize();
-    let client = mqtt::AsyncClient::new(opts).unwrap();
+    let client = mqtt::AsyncClient::new(cli_opts)?;
+
+    let conn_opts = ConnectOptionsBuilder::new().finalize(); // connection timeout maybe?
+    client.connect(conn_opts).await?;
 
     start.notified().await;
 
+    let mut succ = 0;
+    let mut fail = 0;
     let mut interval = time::interval(interval);
+
     for id in start_id..start_id + count {
         interval.tick().await;
 
@@ -93,55 +114,77 @@ async fn publisher_task(
             creation: SystemTime::now(),
         };
 
-        let payload = bincode::serialize(&payload).unwrap();
+        let payload = bincode::serialize(&payload).expect("serialization should behave nicely");
         let message = Message::new(TOPIC, payload, QOS);
 
-        client.publish(message);
+        match client.try_publish(message)?.await {
+            Ok(()) => succ += 1,
+            Err(_) => fail += 1,
+        }
     }
-    Ok(())
+
+    // we waited for every message to be pulished so there is no messages in flight
+    // disconenct immediately
+    client.disconnect(None).await?;
+
+    Ok((succ, fail))
 }
 
-async fn subscriber_task(broker: String, expecting: usize) -> Result<(), ()> {
+async fn subscriber_task(
+    broker: String,
+    expecting: usize,
+    receiving: CancellationToken,
+) -> Result<(usize, u32, u32, Duration), mqtt::Error> {
     let mut latencies = Vec::with_capacity(expecting);
     let mut cache = vec![false; expecting];
     let mut dup = 0;
+    let mut received = 0;
 
-    let opts = CreateOptionsBuilder::new().finalize();
-    let mut client = mqtt::AsyncClient::new(opts).unwrap();
+    let cli_opts = CreateOptionsBuilder::new()
+        .server_uri(broker)
+        .max_buffered_messages(MAX_BUFFERED)
+        .finalize();
+    let mut client = mqtt::AsyncClient::new(cli_opts)?;
 
     let stream = client.get_stream(None); // None = unbound channel
 
-    let conn_opts = ConnectOptionsBuilder::new().finalize();
-    client.connect(conn_opts).await.unwrap();
-    client.subscribe(TOPIC, QOS).await.unwrap();
+    let conn_opts = ConnectOptionsBuilder::new().finalize(); // connection timeout maybe?
+    client.connect(conn_opts).await?;
+    client.subscribe(TOPIC, QOS).await?;
 
     loop {
-        let message = stream
-            .recv()
-            .await
-            .expect("client should not close the channel");
-        if let Some(message) = message {
-            let pl: Payload = bincode::deserialize(message.payload())
-                .expect("serialization and deserialization should occur without errors");
+        tokio::select! {
+            biased;
 
-            if cache[pl.id] {
-                dup += 1;
-            } else {
-                cache[pl.id] = true;
-                break;
-            }
+            _ = receiving.cancelled() => break,
 
-            match pl.creation.elapsed() {
-                Ok(latency) => {
-                    latencies.push(latency);
+            message = stream.recv() => {
+                if let Some(message) = message.expect("client doesn't close the channel") {
+                    let Payload { id, creation } = bincode::deserialize(message.payload())
+                        .expect("receiving only messaged that our publishers produced");
+
+                    if cache[id] {
+                        dup += 1;
+                    } else {
+                        cache[id] = true;
+                        received += 1;
+                    }
+
+                    match creation.elapsed() {
+                        Ok(latency) => latencies.push(latency),
+                        Err(err) => println!("time error {}", err),
+                    }
+                } else {
+                    panic!("subscriber lost connection");
                 }
-                Err(err) => println!("time error {}", err),
-            }
-        } else {
-            println!("disconnected");
+            },
         }
     }
-    Ok(())
+
+    client.disconnect(None).await?;
+
+    let mean = latencies.iter().sum::<Duration>() / latencies.len() as u32;
+    Ok((expecting, received, dup, mean))
 }
 
 mod config {
@@ -161,7 +204,6 @@ mod config {
         pub clients: u32,
         pub rate: u64,    // messages per second
         pub count: usize, // total of messages to publish
-        pub size: u32,    //size of the message
     }
 
     #[derive(Deserialize)]

@@ -1,0 +1,11 @@
+wait = 5 # wait 5 seconds before start publishing
+
+[[publishers]] 
+broker = "localhost:1883"
+clients = 5
+rate = 1000
+count = 50000
+
+[[subscribers]]
+broker = "localhost:1883"
+clients = 100
