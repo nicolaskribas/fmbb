@@ -2,10 +2,10 @@ wait = 5 # wait 5 seconds before start publishing
 
 [[publishers]] 
 broker = "localhost:1883"
-clients = 5
-rate = 1000
-count = 50000
+clients = 1
+rate = 1
+count = 1
 
 [[subscribers]]
 broker = "localhost:1883"
-clients = 100
+clients = 1
