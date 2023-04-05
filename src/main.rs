@@ -1,9 +1,10 @@
-use mqtt::{ConnectOptionsBuilder, CreateOptionsBuilder, Message};
+use mqtt::{ConnectOptionsBuilder, CreateOptionsBuilder, DeliveryToken, Message};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::{env, process, vec};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
 use tokio::time::{self, sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -11,7 +12,7 @@ use paho_mqtt as mqtt;
 
 static TOPIC: &str = "federated/benchmark";
 static QOS: i32 = 2;
-static MAX_BUFFERED: i32 = 0;
+static MAX_BUFFERED: i32 = 64000; // 0 = do not buffer offline publications
 
 #[tokio::main]
 async fn main() {
@@ -61,11 +62,20 @@ async fn main() {
     start_publishing.notify_waiters();
 
     for publisher in pubs {
-        let res = publisher.await.unwrap().unwrap();
-        println!(
-            "Published {} messages with success, {} failed",
-            res.0, res.1
-        );
+        match publisher.await {
+            Ok(Ok((succ, fail))) => {
+                println!(
+                    "Published {} messages with success, {} failed",
+                    succ, fail
+                );
+            },
+            Err(e) => {
+                eprintln!("Error in publisher: {}", e);
+            }, 
+            Ok(Err(e)) => {
+                eprintln!("Error in publisher: {}", e);
+            },
+        }
     }
 
     // give subscribers some time to receive all publications
@@ -73,7 +83,9 @@ async fn main() {
     stop_receiving.cancel();
 
     for subscriber in subs {
-        let res = subscriber.await.unwrap().unwrap();
+        let Ok(Ok(res)) = subscriber.await else {
+            continue;
+        };
         println!("Subscriber was expecting {} messages, received {} unique messages, {} duplicates, latency: {}ms", res.0, res.1, res.2, res.3.as_millis());
     }
 }
@@ -90,7 +102,7 @@ async fn publisher_task(
     count: usize,
     interval: Duration,
     start: Arc<Notify>,
-) -> Result<(u32, u32), mqtt::Error> {
+) -> Result<(usize, usize), mqtt::Error> {
     let cli_opts = CreateOptionsBuilder::new()
         .server_uri(broker)
         .max_buffered_messages(MAX_BUFFERED)
@@ -100,10 +112,11 @@ async fn publisher_task(
     let conn_opts = ConnectOptionsBuilder::new().finalize(); // connection timeout maybe?
     client.connect(conn_opts).await?;
 
+    // create a new task to collect result of the publication
+    let (tx, result) = spawn_result_collector();
+
     start.notified().await;
 
-    let mut succ = 0;
-    let mut fail = 0;
     let mut interval = time::interval(interval);
 
     for id in start_id..start_id + count {
@@ -117,17 +130,41 @@ async fn publisher_task(
         let payload = bincode::serialize(&payload).expect("serialization should behave nicely");
         let message = Message::new(TOPIC, payload, QOS);
 
-        match client.try_publish(message)?.await {
+        let delivery = client.try_publish(message)?;
+
+        if let Err(e) = tx.send(delivery) {
+            eprintln!("error delivering: {}", e);
+        }
+    }
+
+    client.disconnect(None).await?;
+
+    Ok(result.await.unwrap())
+}
+
+fn spawn_result_collector() -> (
+    mpsc::UnboundedSender<DeliveryToken>,
+    JoinHandle<(usize, usize)>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(publisher_collect_result(rx));
+    (tx, handle)
+}
+
+async fn publisher_collect_result(
+    mut channel: mpsc::UnboundedReceiver<DeliveryToken>,
+) -> (usize, usize) {
+    let mut succ = 0;
+    let mut fail = 0;
+
+    while let Some(delivery) = channel.recv().await {
+        match delivery.await {
             Ok(()) => succ += 1,
             Err(_) => fail += 1,
         }
     }
 
-    // we waited for every message to be pulished so there is no messages in flight
-    // disconenct immediately
-    client.disconnect(None).await?;
-
-    Ok((succ, fail))
+    (succ, fail)
 }
 
 async fn subscriber_task(
