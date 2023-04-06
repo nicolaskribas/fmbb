@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::{env, process, vec};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Barrier};
 use tokio::task::JoinHandle;
 use tokio::time::{self, sleep, Duration};
 use tokio_util::sync::CancellationToken;
@@ -12,7 +12,7 @@ use paho_mqtt as mqtt;
 
 static TOPIC: &str = "federated/benchmark";
 static QOS: i32 = 2;
-static MAX_BUFFERED: i32 = 64000; // 0 = do not buffer offline publications
+static MAX_BUFFERED: i32 = 10000; // 0 = do not buffer offline publications
 
 #[tokio::main]
 async fn main() {
@@ -26,10 +26,14 @@ async fn main() {
         process::exit(1);
     });
 
-    let start_publishing = Arc::new(Notify::new());
     let stop_receiving = CancellationToken::new();
 
     let mut pubs = Vec::new();
+
+    let total = config.publishers.iter().fold(0, |x, p| x + p.clients)
+        + config.subscribers.iter().fold(0, |x, p| x + p.clients);
+
+    let start_barrier = Arc::new(Barrier::new(total));
 
     let mut id = 0;
     for batch in &config.publishers {
@@ -39,7 +43,8 @@ async fn main() {
                 id,
                 batch.count,
                 Duration::from_nanos(1_000_000_000 / batch.rate),
-                start_publishing.clone(),
+                start_barrier.clone(),
+                Duration::from_secs(config.wait),
             );
             pubs.push(tokio::spawn(task));
             id += batch.count;
@@ -48,38 +53,32 @@ async fn main() {
     let total_messages = id;
 
     let mut subs = Vec::new();
-
     for batch in &config.subscribers {
         for _ in 0..batch.clients {
-            let task =
-                subscriber_task(batch.broker.clone(), total_messages, stop_receiving.clone());
+            let task = subscriber_task(
+                batch.broker.clone(),
+                total_messages,
+                stop_receiving.clone(),
+                start_barrier.clone(),
+            );
             subs.push(tokio::spawn(task));
         }
     }
 
-    // wait some time and then start publishers
-    sleep(Duration::from_secs(config.wait)).await;
-    start_publishing.notify_waiters();
-
     for publisher in pubs {
         match publisher.await {
             Ok(Ok((succ, fail))) => {
-                println!(
-                    "Published {} messages with success, {} failed",
-                    succ, fail
-                );
-            },
+                println!("Published {} messages with success, {} failed", succ, fail);
+            }
             Err(e) => {
-                eprintln!("Error in publisher: {}", e);
-            }, 
+                eprintln!("Error in publisher: {}!!!", e);
+            }
             Ok(Err(e)) => {
-                eprintln!("Error in publisher: {}", e);
-            },
+                eprintln!("Error in publisher: {}!()!", e);
+            }
         }
     }
 
-    // give subscribers some time to receive all publications
-    sleep(Duration::from_secs(5)).await;
     stop_receiving.cancel();
 
     for subscriber in subs {
@@ -101,7 +100,8 @@ async fn publisher_task(
     start_id: usize,
     count: usize,
     interval: Duration,
-    start: Arc<Notify>,
+    start: Arc<Barrier>,
+    wait: time::Duration,
 ) -> Result<(usize, usize), mqtt::Error> {
     let cli_opts = CreateOptionsBuilder::new()
         .server_uri(broker)
@@ -115,9 +115,11 @@ async fn publisher_task(
     // create a new task to collect result of the publication
     let (tx, result) = spawn_result_collector();
 
-    start.notified().await;
+    // wait every other publisher/subscriber to be setted up
+    start.wait().await;
 
     let mut interval = time::interval(interval);
+    // interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     for id in start_id..start_id + count {
         interval.tick().await;
@@ -136,9 +138,14 @@ async fn publisher_task(
             eprintln!("error delivering: {}", e);
         }
     }
+    println!("done publishing");
 
-    client.disconnect(None).await?;
+    // sleep(wait).await;
+    println!("->disconnecting with timeout now: {:?}", SystemTime::now());
+    client.disconnect_after(wait).await?;
+    println!("->disconected: {:?}", SystemTime::now());
 
+    drop(tx);
     Ok(result.await.unwrap())
 }
 
@@ -151,8 +158,7 @@ fn spawn_result_collector() -> (
     (tx, handle)
 }
 
-async fn publisher_collect_result(
-    mut channel: mpsc::UnboundedReceiver<DeliveryToken>,
+async fn publisher_collect_result(mut channel: mpsc::UnboundedReceiver<DeliveryToken>,
 ) -> (usize, usize) {
     let mut succ = 0;
     let mut fail = 0;
@@ -160,7 +166,18 @@ async fn publisher_collect_result(
     while let Some(delivery) = channel.recv().await {
         match delivery.await {
             Ok(()) => succ += 1,
-            Err(_) => fail += 1,
+            Err(mqtt::Error::Paho(-11)) => {
+                fail += 1;
+                eprintln!("Publication incomplete, there was inflight messages when the client connection was closed (problably). Try increasing the waiting time.");
+            }
+            Err(mqtt::Error::PahoDescr(-11, e)) => {
+                fail += 1;
+                eprintln!("{}, there was inflight messages when the client connection was closed (problably). Try increasing the waiting time.", e);
+            }
+            Err(e) => {
+                fail += 1;
+                eprintln!("Error sending publication: {e:?}");
+            }
         }
     }
 
@@ -171,6 +188,7 @@ async fn subscriber_task(
     broker: String,
     expecting: usize,
     receiving: CancellationToken,
+    start_barrier: Arc<Barrier>,
 ) -> Result<(usize, u32, u32, Duration), mqtt::Error> {
     let mut latencies = Vec::with_capacity(expecting);
     let mut cache = vec![false; expecting];
@@ -188,6 +206,10 @@ async fn subscriber_task(
     let conn_opts = ConnectOptionsBuilder::new().finalize(); // connection timeout maybe?
     client.connect(conn_opts).await?;
     client.subscribe(TOPIC, QOS).await?;
+
+    // wait in the barrier, this is for publihsers to know we finished setting up and are able to
+    // receive publications
+    start_barrier.wait().await;
 
     loop {
         tokio::select! {
@@ -238,7 +260,7 @@ mod config {
     #[derive(Deserialize)]
     pub struct PubBatch {
         pub broker: String,
-        pub clients: u32,
+        pub clients: usize,
         pub rate: u64,    // messages per second
         pub count: usize, // total of messages to publish
     }
@@ -246,7 +268,7 @@ mod config {
     #[derive(Deserialize)]
     pub struct SubBatch {
         pub broker: String,
-        pub clients: u32,
+        pub clients: usize,
     }
 
     pub fn load(file: &str) -> Result<Settings, ConfigError> {
