@@ -100,7 +100,7 @@ async fn main() {
         eprintln!("Subscriber {sub_id} on broker {broker} was expecting {expecting} messages, received {unique} unique messages, {dup} duplicates");
         for times in timings {
             let time = times.0.to_rfc3339_opts(SecondsFormat::Nanos, true);
-            let latency = times.1.num_milliseconds();
+            let latency = times.1.num_nanoseconds().unwrap(); // nanosecods can overflow
             println!("{broker}, {sub_id}, {time}, {latency}");
         }
     }
