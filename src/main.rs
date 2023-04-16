@@ -1,17 +1,17 @@
+use chrono::{DateTime, Utc, SecondsFormat};
 use mqtt::{ConnectOptionsBuilder, CreateOptionsBuilder, DeliveryToken, Message};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::SystemTime;
 use std::{env, process, vec};
 use tokio::sync::{mpsc, Barrier};
 use tokio::task::JoinHandle;
-use tokio::time::{self, sleep, Duration};
+use tokio::time::{self, sleep};
 use tokio_util::sync::CancellationToken;
 
 use paho_mqtt as mqtt;
 
 static TOPIC: &str = "federated/benchmark";
-static QOS: i32 = 2;
+static QOS: i32 = 0;
 static MAX_BUFFERED: i32 = 10000; // 0 = do not buffer offline publications
 
 #[tokio::main]
@@ -26,6 +26,7 @@ async fn main() {
         process::exit(1);
     });
 
+    // for notifying subscribers to stop waiting for publications
     let stop_receiving = CancellationToken::new();
 
     let mut pubs = Vec::new();
@@ -42,9 +43,9 @@ async fn main() {
                 batch.broker.clone(),
                 id,
                 batch.count,
-                Duration::from_nanos(1_000_000_000 / batch.rate),
+                time::Duration::from_nanos(1_000_000_000 / batch.rate),
                 start_barrier.clone(),
-                Duration::from_secs(config.wait),
+                time::Duration::from_secs(config.wait),
             );
             pubs.push(tokio::spawn(task));
             id += batch.count;
@@ -54,9 +55,10 @@ async fn main() {
 
     let mut subs = Vec::new();
     for batch in &config.subscribers {
-        for _ in 0..batch.clients {
+        for i in 0..batch.clients {
             let task = subscriber_task(
                 batch.broker.clone(),
+                i,
                 total_messages,
                 stop_receiving.clone(),
                 start_barrier.clone(),
@@ -68,7 +70,7 @@ async fn main() {
     for publisher in pubs {
         match publisher.await {
             Ok(Ok((succ, fail))) => {
-                println!("Published {} messages with success, {} failed", succ, fail);
+                eprintln!("Published {} messages with success, {} failed", succ, fail);
             }
             Err(e) => {
                 eprintln!("Error in publisher: {}!!!", e);
@@ -79,27 +81,42 @@ async fn main() {
         }
     }
 
+    sleep(time::Duration::from_secs(config.wait)).await;
     stop_receiving.cancel();
 
     for subscriber in subs {
         let Ok(Ok(res)) = subscriber.await else {
+            eprintln!("Error in subcriber!!!");
             continue;
         };
-        println!("Subscriber was expecting {} messages, received {} unique messages, {} duplicates, latency: {}ms", res.0, res.1, res.2, res.3.as_millis());
+
+        let broker = res.0;
+        let sub_id = res.1;
+        let expecting = res.2;
+        let unique = res.3;
+        let dup = res.4;
+        let timings = res.5;
+
+        eprintln!("Subscriber {sub_id} on broker {broker} was expecting {expecting} messages, received {unique} unique messages, {dup} duplicates");
+        for times in timings {
+            let time = times.0.to_rfc3339_opts(SecondsFormat::Nanos, true);
+            let latency = times.1.num_milliseconds();
+            println!("{broker}, {sub_id}, {time}, {latency}");
+        }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Payload {
     pub id: usize,
-    pub creation: SystemTime,
+    pub creation: DateTime<Utc>,
 }
 
 async fn publisher_task(
     broker: String,
     start_id: usize,
     count: usize,
-    interval: Duration,
+    interval: time::Duration,
     start: Arc<Barrier>,
     wait: time::Duration,
 ) -> Result<(usize, usize), mqtt::Error> {
@@ -117,6 +134,7 @@ async fn publisher_task(
 
     // wait every other publisher/subscriber to be setted up
     start.wait().await;
+    eprintln!("started={}", Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true));
 
     let mut interval = time::interval(interval);
     // interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -126,7 +144,7 @@ async fn publisher_task(
 
         let payload = Payload {
             id,
-            creation: SystemTime::now(),
+            creation: Utc::now(),
         };
 
         let payload = bincode::serialize(&payload).expect("serialization should behave nicely");
@@ -138,15 +156,16 @@ async fn publisher_task(
             eprintln!("error delivering: {}", e);
         }
     }
-    println!("done publishing");
 
-    // sleep(wait).await;
-    println!("->disconnecting with timeout now: {:?}", SystemTime::now());
+    let wait = time::Duration::from_secs(wait.as_nanos() as u64); // temporary fix https://github.com/eclipse/paho.mqtt.rust/pull/202
     client.disconnect_after(wait).await?;
-    println!("->disconected: {:?}", SystemTime::now());
 
-    drop(tx);
-    Ok(result.await.unwrap())
+    drop(tx); // droping the sender part of the channel makes the collector know that it should
+    // stop waiting for publications results
+    
+    let result = result.await.unwrap();
+    eprintln!("done publishing={}", Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true));
+    Ok(result)
 }
 
 fn spawn_result_collector() -> (
@@ -186,18 +205,19 @@ async fn publisher_collect_result(mut channel: mpsc::UnboundedReceiver<DeliveryT
 
 async fn subscriber_task(
     broker: String,
+    sub_id: usize,
     expecting: usize,
     receiving: CancellationToken,
     start_barrier: Arc<Barrier>,
-) -> Result<(usize, u32, u32, Duration), mqtt::Error> {
+) -> Result<(String, usize, usize, usize, usize, Vec<(DateTime<Utc>, chrono::Duration)>), mqtt::Error> {
     let mut latencies = Vec::with_capacity(expecting);
     let mut cache = vec![false; expecting];
     let mut dup = 0;
-    let mut received = 0;
+    let mut unique = 0;
 
     let cli_opts = CreateOptionsBuilder::new()
-        .server_uri(broker)
-        .max_buffered_messages(MAX_BUFFERED)
+        .server_uri(&broker)
+        .max_buffered_messages(0) // there is nothing to buffer, subscriber only receive
         .finalize();
     let mut client = mqtt::AsyncClient::new(cli_opts)?;
 
@@ -219,6 +239,8 @@ async fn subscriber_task(
 
             message = stream.recv() => {
                 if let Some(message) = message.expect("client doesn't close the channel") {
+                    let now = Utc::now();
+
                     let Payload { id, creation } = bincode::deserialize(message.payload())
                         .expect("receiving only messaged that our publishers produced");
 
@@ -226,12 +248,14 @@ async fn subscriber_task(
                         dup += 1;
                     } else {
                         cache[id] = true;
-                        received += 1;
+                        unique += 1;
                     }
 
-                    match creation.elapsed() {
-                        Ok(latency) => latencies.push(latency),
-                        Err(err) => println!("time error {}", err),
+                    latencies.push((now, now - creation));
+
+                    if unique == expecting { // received all messages
+                        client.stop_stream();
+                        break;
                     }
                 } else {
                     panic!("subscriber lost connection");
@@ -242,8 +266,7 @@ async fn subscriber_task(
 
     client.disconnect(None).await?;
 
-    let mean = latencies.iter().sum::<Duration>() / latencies.len() as u32;
-    Ok((expecting, received, dup, mean))
+    Ok((broker, sub_id, expecting, unique, dup, latencies))
 }
 
 mod config {
