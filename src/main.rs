@@ -81,8 +81,10 @@ async fn main() {
         }
     }
 
-    sleep(time::Duration::from_secs(config.wait)).await;
-    stop_receiving.cancel();
+    tokio::spawn(async move{
+        sleep(time::Duration::from_secs(config.wait)).await;
+        stop_receiving.cancel();
+    });
 
     for subscriber in subs {
         let Ok(Ok(res)) = subscriber.await else {
@@ -235,7 +237,10 @@ async fn subscriber_task(
         tokio::select! {
             biased;
 
-            _ = receiving.cancelled() => break,
+            _ = receiving.cancelled() => {
+                eprintln!("Subscriber {sub_id} on broker {broker} stopped before receiving all pubs");
+                break;
+            },
 
             message = stream.recv() => {
                 if let Some(message) = message.expect("client doesn't close the channel") {
